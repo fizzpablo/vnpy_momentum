@@ -1,0 +1,26 @@
+# Linux production compose file.  IB Gateway runs on the host and listens only
+# on 127.0.0.1:4002 (or 7497); host networking preserves that isolation.
+services:
+  paper-strategy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vnpy-paper-strategy:local
+    container_name: vnpy-paper-strategy
+    network_mode: host
+    init: true
+    stdin_open: true
+    tty: true
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    volumes:
+      - ./runtime/config:/runtime/config:ro
+      - ./runtime/state:/runtime/state
+      - ./runtime/logs:/runtime/logs
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["/runtime/config/paper.yaml"]

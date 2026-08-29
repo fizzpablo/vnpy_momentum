@@ -22,6 +22,12 @@ dist
 
 # VeighNa
 .vntrader
+state/
+runtime/config/paper.yaml
+runtime/state/
+runtime/logs/
+.env
+*.lock
 
 # Visual Studio intermediate files
 *.exp

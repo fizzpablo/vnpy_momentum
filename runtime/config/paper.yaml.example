@@ -1,0 +1,32 @@
+# Copy to runtime/config/paper.yaml and replace the Paper account value.
+# With compose.yaml on Linux, 127.0.0.1 reaches the host's IB Gateway.
+ibkr:
+  environment: paper
+  gateway_name: IB
+  host: 127.0.0.1
+  client_id: 31
+  account: DU000000
+  port: 4002
+
+strategy:
+  strategy_id: us-paper-v1
+  capital: 1000
+  state_path: ../state/us-paper-v1.json
+  turnover_threshold: 1000000
+  turnover_max_age_sec: 15
+  max_order_notional: 300
+  max_active_orders: 10
+  base_position_pct: 0.25
+  max_position_pct: 0.65
+  stop_loss_pct: 0.10
+  catastrophe_stop_pct: 0.15
+  aum_loss_limit_pct: 0.05
+
+basket:
+  - symbol: AAPL
+    exchange: SMART
+    currency: USD
+    market: US
+    max_allocation: 650
+    lot_size: 1
+    volume_multiplier: 100
