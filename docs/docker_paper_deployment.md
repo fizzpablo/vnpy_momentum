@@ -16,10 +16,10 @@
 mkdir -p runtime/config runtime/state runtime/logs
 cp runtime/config/paper.yaml.example runtime/config/paper.yaml
 chmod 600 runtime/config/paper.yaml
-sudo chown -R 10001:10001 runtime/state runtime/logs
+sudo chown -R 10001:10001 runtime/config runtime/state runtime/logs
 ```
 
-编辑 `runtime/config/paper.yaml`，填入实际 Paper 账户号、核准的标的与资金上限。配置中的状态路径已指向独立挂载卷 `/runtime/state`，不要改为容器内路径。
+镜像内策略以 UID `10001` 运行，故 `config` 也必须归该 UID 所有；文件仍为 `0600`，且容器将其只读挂载。编辑 `runtime/config/paper.yaml`，填入实际 Paper 账户号、核准的标的与资金上限。配置中的状态路径已指向独立挂载卷 `/runtime/state`，不要改为容器内路径。
 
 构建镜像并先校验配置（该命令不连接 Gateway）：
 

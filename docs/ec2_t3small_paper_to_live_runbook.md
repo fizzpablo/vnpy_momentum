@@ -85,6 +85,10 @@ sudo -iu trader
 
 ## 3. 部署代码与验证（阶段 A）
 
+策略部署有两种**二选一**的方式：原生 Python（本节 3.1）或 Docker Compose（本节 3.2）。两者均使用宿主机的 IB Gateway，均必须保留人工 `start` 门禁；不得在同一账户、`strategy_id` 或 state 文件上同时运行两个版本。
+
+### 3.1 原生 Python
+
 以 `trader` 身份执行。固定 Git commit 和依赖版本；生产主机不做无审计的 `pip install -U`。
 
 ```bash
@@ -102,6 +106,40 @@ python -m pip freeze | tee /srv/ibkr/logs/pip-freeze-$(date +%F).txt
 ```
 
 部署记录至少包括：Git commit、Python/vn.py/vnpy_ib/IB API/IB Gateway 版本、配置 SHA-256、AMI 和 EBS 快照 ID。升级只能采用“新 release 目录 -> 离线测试 -> Paper 回归 -> 人工切换”的方式；保留上一个可运行 release 以便回滚。
+
+### 3.2 Docker Compose（容器化策略，推荐固化依赖时使用）
+
+仓库的 `Dockerfile` 与 `compose.yaml` 只容器化策略；**IB Gateway 不在容器中**，继续运行在宿主机。这保留 Gateway 的首次登录、二次验证和人工会话确认。Compose 使用 `network_mode: host`，故容器内的 `127.0.0.1:4002` 就是宿主机 Gateway；不要添加 `ports:` 映射，也不要将 Gateway 绑定到 Docker 网桥、私网或公网。
+
+先按 Docker 官方 Ubuntu 安装说明安装 Docker Engine 和 Compose v2，再确认：
+
+```bash
+docker version
+docker compose version
+```
+
+`docker` 组相当于宿主机 root 权限。默认由受控的运维账户通过 `sudo docker` 执行，不因方便而把普通交易账户加入该组。t3.small 内存有限：首次 `docker compose build` 会占用较多 CPU、内存和网络带宽，应在非交易时段执行，并保留第 2 节的 swap；更稳妥的做法是在 CI/构建机生成并扫描镜像，再按镜像 digest 部署到 EC2。
+
+以固定的 Git commit 检出代码后，创建运行期目录并设置持久化卷权限：
+
+```bash
+cd /opt/vnpy
+sudo install -d -m 0700 runtime/config runtime/state runtime/logs
+sudo cp runtime/config/paper.yaml.example runtime/config/paper.yaml
+sudo chmod 600 runtime/config/paper.yaml
+sudo chown -R 10001:10001 runtime/config runtime/state runtime/logs
+```
+
+编辑 `runtime/config/paper.yaml`，填入 Paper 账户与已批准的限额；它的 `state_path` 必须保持指向 `/runtime/state` 挂载卷。构建镜像后进行离线解析，并记录 image ID/digest：
+
+```bash
+sudo docker compose build
+sudo docker compose run --rm --no-deps --entrypoint python paper-strategy \
+  -c "from user_strategy.config import load_config; print(load_config('/runtime/config/paper.yaml'))"
+sudo docker image inspect vnpy-paper-strategy:local --format '{{.Id}}'
+```
+
+Compose 已设置只读根文件系统、`/tmp` tmpfs、删除 Linux capabilities、`no-new-privileges` 和 `restart: "no"`；state 与日志是唯一可写的持久化路径。不要以覆盖 Compose 配置的方式恢复自动重启或增加特权。完整的容器运行、脱离终端和恢复说明见 [Paper 策略 Docker 部署](docker_paper_deployment.md)。
 
 ## 4. 安装与保护 IB Gateway（阶段 B）
 
@@ -140,7 +178,7 @@ ss -ltnp | grep -E ':(4001|4002|7496|7497)'
 
 ## 5. Paper 配置、启动与验收（阶段 B/C）
 
-创建运行时配置，权限为运行账户独占。使用仓库的 [示例](../user_strategy/paper.example.yaml) 起步；账户号必须是 Paper 账户。
+原生 Python 部署时，创建运行时配置，权限为运行账户独占。使用仓库的 [示例](../user_strategy/paper.example.yaml) 起步；账户号必须是 Paper 账户。Docker 部署则使用上一节创建的 `runtime/config/paper.yaml`，不要创建第二份同策略配置。
 
 ```bash
 umask 077
@@ -192,13 +230,20 @@ python -c "from user_strategy.config import load_config; print(load_config('/srv
    ss -ltnp | grep ':4002'
    ```
 
-3. 启动策略；程序启动后应显示 `state=PAUSED`：
+3. 仅按所选部署方式启动一个策略；程序启动后应显示 `state=PAUSED`：
 
    ```bash
+   # 原生 Python
    tmux new -s paper-us
    cd /opt/vnpy && . .venv/bin/activate
    python -m user_strategy.run_paper /srv/ibkr/config/paper-us.yaml \
      2>&1 | tee -a /srv/ibkr/logs/paper-us-$(date +%F).log
+   ```
+
+   ```bash
+   # Docker：保持前台交互，以便值班人员人工输入 start
+   cd /opt/vnpy
+   sudo docker compose run --rm paper-strategy
    ```
 
 4. 确认账户白名单、唯一股票合约、参考价、实时行情、成交额、OMS 对账和 state 文件均正常。
@@ -217,13 +262,14 @@ Paper 验收至少持续 10 个正常交易日，并按 [Paper 故障演练](pap
 5. **独立风险层**：在 Gateway/TWS 之外增加经过测试的订单频率、单笔名义金额、活动委托数、日损失和 kill switch 限制；策略内限额不是唯一防线。
 6. **告警与可观测性**：实现进程退出、Gateway 断线、磁盘/内存不足、`HALTED`、未保护仓位、订单拒绝和日损失阈值的外部告警；告警到值班渠道并确认送达。
 7. **保密与备份**：账户凭据使用受控密钥机制；state/logs 做加密备份，恢复过程在 Paper 演练。
-8. **双人审查**：代码评审人和交易/风控负责人分别签字；所有 Paper 验收与故障演练证据可追溯。
+8. **容器供应链（如使用 Docker）**：Live release 必须按不可变镜像 digest 部署，完成镜像来源、依赖漏洞扫描和 SBOM/构建记录审查；不可使用浮动标签、运行中的容器内 `pip install` 或未审查的 Compose override。
+9. **双人审查**：代码评审人和交易/风控负责人分别签字；所有 Paper 验收与故障演练证据可追溯。
 
 上述变更的验收标准是：离线单元测试覆盖 Live 拒绝/授权、错误账户、错误合约、断线、重连、未知订单、部分成交、保护单失败、熔断与重启；随后以相同 release 在 Paper 完整回归。没有完整证据，不生成 Live release。
 
 ## 7. 实盘部署与首日运行（阶段 E）
 
-在已获书面批准且 Live release 已通过第 6 节验收后执行。实盘账户应使用独立的配置、state、日志和 client ID；绝不复用 Paper 状态文件。
+在已获书面批准且 Live release 已通过第 6 节验收后执行。实盘账户应使用独立的配置、state、日志和 client ID；绝不复用 Paper 状态文件。当前 Compose 文件名为 `paper-strategy`、入口为 `run_paper`，不能原样用于 Live；任何容器化 Live 部署也必须属于获批 Live release 的独立 manifest 和镜像 digest。
 
 ```text
 /srv/ibkr/config/live-us.yaml      # chmod 600，非 Git
