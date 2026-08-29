@@ -1,0 +1,23 @@
+{
+  "lab_path": "../alpha_lab",
+  "signal_path": "../alpha_lab/signal/my_signal.parquet",
+  "vt_symbols": ["AAPL.SMART", "MSFT.SMART"],
+  "interval": "d",
+  "start": "2024-01-01T00:00:00",
+  "end": "2024-12-31T23:59:59",
+  "capital": 1000000,
+  "risk_free": 0.0,
+  "annual_days": 252,
+  "strategy": {
+    "class": "vnpy.alpha.strategy.strategies.equity_demo_strategy:EquityDemoStrategy",
+    "setting": {
+      "top_k": 10,
+      "n_drop": 2,
+      "min_days": 3,
+      "cash_ratio": 0.95,
+      "min_volume": 1,
+      "price_add": 0.005
+    }
+  },
+  "output_dir": "backtest_output/example"
+}
