@@ -82,6 +82,7 @@ class StrategyEngine:
         self._seen_trades: set[str] = set()
         self._registered = False
         self._last_disk_check: datetime | None = None
+        self._references_loaded = False
         self.alerts = TelegramAlerts(config.alerts)
 
     @staticmethod
@@ -107,7 +108,6 @@ class StrategyEngine:
             self.market.restore_sequence(vt_symbol, sequence)
         if persisted.get("state") not in (None, EngineState.PAUSED.value):
             self.halt("persisted non-paused strategy state requires manual reset")
-        self._load_references()
         self._persist()
 
     def close(self) -> None:
@@ -122,7 +122,15 @@ class StrategyEngine:
         command = command.lower()
         if command == "start":
             if self.state != EngineState.PAUSED or not self.snapshot_complete or not self.reconciled or not self.account_ready or not self.cash_ready or not all(item.contract_ready for item in self.runtimes.values()):
-                self._log("start refused: preflight is incomplete")
+                self._log(
+                    "start refused: preflight incomplete "
+                    f"state={self.state.value} "
+                    f"snapshot_complete={self.snapshot_complete} "
+                    f"reconciled={self.reconciled} "
+                    f"account_ready={self.account_ready} "
+                    f"cash_ready={self.cash_ready} "
+                    f"contracts_ready={all(item.contract_ready for item in self.runtimes.values())}"
+                )
                 return
             self.state = EngineState.RUNNING
         elif command == "pause":
@@ -254,6 +262,12 @@ class StrategyEngine:
                 return
         runtime.contract_ready = True
 
+        if not self._references_loaded and all(
+            item.contract_ready for item in self.runtimes.values()
+        ):
+            self._references_loaded = True
+            self._load_references()
+
     def on_ib_connection(self, event: Event) -> None:
         data = event.data
         if isinstance(data, dict) and data.get("connected") is True:
@@ -297,11 +311,9 @@ class StrategyEngine:
         log: LogData = event.data
         if log.gateway_name != self.config.gateway_name:
             return
-        message = log.msg.lower()
-        if any(text in message for text in ("disconnected", "connection closed", "not connected", "连接断开")):
-            self.notify_gateway_disconnected()
-        elif any(text in message for text in ("connected", "connection established", "连接成功")):
-            self.notify_gateway_reconnected()
+        # Connection state is driven exclusively by the explicit
+        # eIbConnection event from vnpy_ib.  Do not infer state from log text.
+        return
 
     def on_tick(self, event: Event) -> None:
         tick: TickData = event.data

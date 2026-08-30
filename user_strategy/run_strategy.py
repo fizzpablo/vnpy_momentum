@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 from pathlib import Path
 
 from vnpy.event import EventEngine
@@ -15,7 +16,14 @@ from .engine import StrategyEngine
 from .instance_lock import InstanceLock
 
 
+def _handle_shutdown(signum, frame) -> None:
+    raise SystemExit(128 + signum)
+
+
 def main() -> None:
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
+
     parser = argparse.ArgumentParser(description="Run the gated vn.py IBKR stock strategy")
     parser.add_argument("config", type=Path)
     parser.add_argument("--backup-dir", type=Path, default=None)
@@ -49,7 +57,7 @@ def main() -> None:
                 abnormal = False
                 break
             strategy.command(command)
-    except BaseException as exc:
+    except Exception as exc:
         if strategy:
             strategy.alerts.send_event("PROCESS_EXIT")
         raise

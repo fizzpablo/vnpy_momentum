@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from typing import Any
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._save_lock = threading.Lock()
 
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -24,13 +26,14 @@ class StateStore:
         return value
 
     def save(self, value: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            with temporary.open("w", encoding="utf-8") as file:
-                json.dump(value, file, sort_keys=True, indent=2)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temporary, self.path)
-        except OSError as exc:
-            raise RuntimeError("strategy state cannot be persisted") from exc
+        with self._save_lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            try:
+                with temporary.open("w", encoding="utf-8") as file:
+                    json.dump(value, file, sort_keys=True, indent=2)
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(temporary, self.path)
+            except OSError as exc:
+                raise RuntimeError("strategy state cannot be persisted") from exc
