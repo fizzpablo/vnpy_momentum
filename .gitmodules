@@ -1,0 +1,3 @@
+[submodule "vnpy_ib"]
+    path = vnpy_ib
+    url = https://github.com/fizzpablo/vnpy_ib.git
