@@ -5,22 +5,37 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: vnpy-paper-strategy:local
+
+    image: vnpy-paper-strategy:${GIT_COMMIT}
+
     container_name: vnpy-paper-strategy
+
+    # IB Gateway runs directly on the Linux host.
+    # Host networking allows the strategy to reach 127.0.0.1:4002.
     network_mode: host
+
     init: true
-    stdin_open: true
-    tty: true
-    restart: "no"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    user: "10001:10001"
+
     read_only: true
+
     tmpfs:
       - /tmp:mode=1777,size=64m
+
     volumes:
       - ./runtime/config:/runtime/config:ro
       - ./runtime/state:/runtime/state
       - ./runtime/logs:/runtime/logs
+
     security_opt:
       - no-new-privileges:true
+
     cap_drop:
       - ALL
+
     command: ["/runtime/config/paper.yaml"]
+
+
