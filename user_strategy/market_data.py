@@ -36,10 +36,15 @@ class MarketDataAdapter:
         self.surge_ratio = surge_ratio
         self.data: dict[str, MarketObservation] = {}
 
-    def update(self, tick: TickData, now: datetime) -> MarketObservation:
+    def update(self, tick: TickData, now: datetime, volume_multiplier: float = 1.0) -> MarketObservation:
         item = self.data.setdefault(tick.vt_symbol, MarketObservation())
-        timestamp = tick.datetime
-        if timestamp.tzinfo is None:
+        extra = getattr(tick, "extra", None) or {}
+        # This is the documented gateway contract.  A bare TickData.turnover is
+        # deliberately insufficient: it cannot prove realtime data or its unit.
+        if extra.get("ib_market_data_type") != 1:
+            return item
+        timestamp = extra.get("ib_rt_time")
+        if not isinstance(timestamp, datetime) or timestamp.tzinfo is None:
             return item
         timestamp = timestamp.astimezone(timezone.utc)
         if abs((now.astimezone(timezone.utc) - timestamp).total_seconds()) > self.max_age_sec:
@@ -47,20 +52,27 @@ class MarketDataAdapter:
         if not (isfinite(tick.last_price) and tick.last_price > 0):
             return item
         item.price, item.timestamp = tick.last_price, timestamp
-        if isfinite(tick.volume) and tick.volume >= 0:
+        cumulative_volume = extra.get("ib_rt_trade_volume")
+        if cumulative_volume is None:
+            cumulative_volume = extra.get("ib_rt_volume")
+        if not isinstance(cumulative_volume, (int, float)) or not isfinite(cumulative_volume) or cumulative_volume < 0:
+            return item
+        if not isinstance(volume_multiplier, (int, float)) or not isfinite(volume_multiplier) or volume_multiplier <= 0:
+            return item
+        if isfinite(cumulative_volume) and cumulative_volume >= 0:
             second = int(timestamp.timestamp())
-            delta = 0.0 if item.last_cumulative_volume is None else tick.volume - item.last_cumulative_volume
-            item.last_cumulative_volume = tick.volume
+            delta = 0.0 if item.last_cumulative_volume is None else cumulative_volume - item.last_cumulative_volume
+            item.last_cumulative_volume = cumulative_volume
             if delta < 0:
                 item.volumes.clear()
             else:
                 item.volumes.append((second, delta))
             while item.volumes and item.volumes[0][0] < second - 299:
                 item.volumes.popleft()
-        extra = tick.extra or {}
-        candidate = extra.get("cumulative_turnover", tick.turnover)
-        if isinstance(candidate, (int, float)) and isfinite(candidate) and candidate >= 0:
-            item.turnover = float(candidate)
+        vwap = extra.get("ib_vwap")
+        if not isinstance(vwap, (int, float)) or not isfinite(vwap) or vwap <= 0:
+            return item
+        item.turnover = float(cumulative_volume * vwap * volume_multiplier)
         return item
 
     def restore_sequence(self, vt_symbol: str, sequence: int) -> None:

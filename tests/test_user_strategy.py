@@ -1,13 +1,14 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from vnpy.event import Event, EventEngine
 from vnpy.trader.constant import Direction, Exchange, Interval, OrderType, Product, Status
-from vnpy.trader.object import AccountData, BarData, ContractData, OrderData, PositionData, TickData
+from vnpy.trader.object import AccountData, BarData, ContractData, LogData, OrderData, PositionData, TickData
 
-from user_strategy.config import StrategyConfig, SymbolConfig
+from user_strategy.config import StrategyConfig, SymbolConfig, load_config
 from user_strategy.engine import EngineState, StrategyEngine, SymbolState
 
 
@@ -17,6 +18,7 @@ class FakeMain:
         self.sent = []
         self.cancelled = []
         self.logs = []
+        self.gateway = type("Gateway", (), {"query_position": lambda self: None})()
 
     def get_all_positions(self): return []
     def get_all_active_orders(self): return []
@@ -29,6 +31,7 @@ class FakeMain:
         self.sent.append(order)
         return order.vt_orderid
     def get_order(self, vt_orderid): return self.orders.get(vt_orderid)
+    def get_gateway(self, gateway_name): return self.gateway
     def cancel_order(self, request, gateway): self.cancelled.append(request)
     def write_log(self, message, source): self.logs.append((message, source))
 
@@ -46,6 +49,7 @@ def setup(tmp_path, monkeypatch):
     main, events = FakeMain(), EventEngine()
     engine = StrategyEngine(main, events, config(tmp_path))
     engine.start()
+    engine.notify_broker_snapshot_complete()
     engine.on_account(Event("account", AccountData(accountid="DU1.USD", gateway_name="IB")))
     engine.on_contract(Event("contract", ContractData(symbol="AAPL", exchange=Exchange.SMART, name="AAPL", product=Product.EQUITY, size=1, pricetick=.01, gateway_name="IB")))
     monkeypatch.setattr("user_strategy.engine.is_open", lambda market, now: True)
@@ -53,7 +57,10 @@ def setup(tmp_path, monkeypatch):
 
 
 def tick():
-    return TickData(symbol="AAPL", exchange=Exchange.SMART, datetime=datetime.now(timezone.utc), last_price=110, volume=10, turnover=2, gateway_name="IB")
+    now = datetime.now(timezone.utc)
+    return SimpleNamespace(symbol="AAPL", exchange=Exchange.SMART, vt_symbol="AAPL.SMART", datetime=now, last_price=110,
+                           volume=10, turnover=2, gateway_name="IB",
+                           extra={"ib_market_data_type": 1, "ib_rt_time": now, "ib_rt_trade_volume": 10, "ib_vwap": 110})
 
 
 def test_paused_signal_never_submits_buy(tmp_path, monkeypatch):
@@ -151,6 +158,8 @@ def test_stop_cancel_before_market_exit(tmp_path, monkeypatch):
     assert main.cancelled and not [o for o in main.sent if o.type is OrderType.MARKET]
     stop.status = Status.CANCELLED
     engine.on_order(Event("order", stop))
+    assert not [o for o in main.sent if o.type is OrderType.MARKET]
+    engine.on_ib_position_snapshot(Event("snapshot", {"account": "DU1", "positions": {"AAPL.SMART": PositionData(symbol="AAPL", exchange=Exchange.SMART, direction=Direction.NET, volume=4, price=100, gateway_name="IB")}}))
     assert main.sent[-1].type is OrderType.MARKET
     assert main.sent[-1].volume == 4
 
@@ -166,6 +175,17 @@ def test_uncertain_stop_status_halts_instead_of_selling(tmp_path, monkeypatch):
     assert not main.sent
 
 
+def test_protective_stop_rejection_halts(tmp_path, monkeypatch):
+    engine, main = setup(tmp_path, monkeypatch)
+    runtime = engine.runtimes["AAPL.SMART"]
+    runtime.state = SymbolState.ENTERED
+    runtime.position = PositionData(symbol="AAPL", exchange=Exchange.SMART, direction=Direction.NET, volume=4, price=100, gateway_name="IB")
+    stop = OrderData(symbol="AAPL", exchange=Exchange.SMART, orderid="stop", type=OrderType.STOP, direction=Direction.SHORT, volume=4, status=Status.REJECTED, gateway_name="IB")
+    runtime.stop_order = stop.vt_orderid
+    engine.on_order(Event("order", stop))
+    assert engine.state is EngineState.HALTED
+
+
 def test_startup_existing_position_halts(tmp_path, monkeypatch):
     class Existing(FakeMain):
         def get_all_positions(self):
@@ -173,6 +193,7 @@ def test_startup_existing_position_halts(tmp_path, monkeypatch):
     main, events = Existing(), EventEngine()
     engine = StrategyEngine(main, events, config(tmp_path))
     engine.start()
+    engine.notify_broker_snapshot_complete()
     assert engine.state is EngineState.HALTED
 
 
@@ -183,6 +204,7 @@ def test_startup_existing_open_order_and_invalid_state_halt(tmp_path, monkeypatc
     main, events = Existing(), EventEngine()
     engine = StrategyEngine(main, events, config(tmp_path))
     engine.start()
+    engine.notify_broker_snapshot_complete()
     assert engine.state is EngineState.HALTED
     config(tmp_path).state_path.write_text("not json", encoding="utf-8")
     with pytest.raises(RuntimeError):
@@ -200,6 +222,23 @@ def test_wrong_account_and_market_closed_block_start_and_buy(tmp_path, monkeypat
     engine.market.signal = lambda *args: (True, 1)
     engine.on_tick(Event("tick", tick()))
     assert not main.sent
+
+
+def test_wrong_gateway_account_halts(tmp_path, monkeypatch):
+    engine, _ = setup(tmp_path, monkeypatch)
+    engine.on_account(Event("account", AccountData(accountid="DU999.USD", gateway_name="IB")))
+    assert engine.state is EngineState.HALTED
+
+
+def test_gateway_log_disconnect_and_reconnect_stay_paused(tmp_path, monkeypatch):
+    engine, _ = setup(tmp_path, monkeypatch)
+    engine.command("start")
+    engine.on_log(Event("log", LogData(gateway_name="IB", msg="connection closed")))
+    assert engine.state is EngineState.PAUSED and not engine.reconciled
+    engine.on_log(Event("log", LogData(gateway_name="IB", msg="connection established")))
+    assert engine.state is EngineState.PAUSED and not engine.reconciled
+    engine.notify_broker_snapshot_complete()
+    assert engine.reconciled
 
 
 def test_disconnect_reconnect_pauses_and_never_resends(tmp_path, monkeypatch):
@@ -230,7 +269,35 @@ def test_global_loss_halts_and_starts_exit(tmp_path, monkeypatch):
     engine.market.data["AAPL.SMART"].price = 40
     engine._evaluate_global_risk()
     assert engine.state is EngineState.HALTED
+    assert not main.sent
+    engine.on_ib_position_snapshot(Event("snapshot", {"account": "DU1", "positions": {"AAPL.SMART": PositionData(symbol="AAPL", exchange=Exchange.SMART, direction=Direction.NET, volume=100, price=100, gateway_name="IB")}}))
     assert main.sent[-1].type is OrderType.MARKET
+
+
+def test_daily_loss_halts_and_starts_exit(tmp_path, monkeypatch):
+    limited = StrategyConfig(**{**config(tmp_path).__dict__, "daily_loss_limit_pct": .01})
+    main, events = FakeMain(), EventEngine()
+    engine = StrategyEngine(main, events, limited)
+    engine.start()
+    runtime = engine.runtimes["AAPL.SMART"]
+    runtime.state = SymbolState.ENTERED
+    runtime.position = PositionData(symbol="AAPL", exchange=Exchange.SMART, direction=Direction.NET, volume=10, price=100, gateway_name="IB")
+    engine.daily_realized_pnl = -101
+    engine._evaluate_global_risk()
+    assert engine.state is EngineState.HALTED and not main.sent
+    engine.on_ib_position_snapshot(Event("snapshot", {"account": "DU1", "positions": {"AAPL.SMART": PositionData(symbol="AAPL", exchange=Exchange.SMART, direction=Direction.NET, volume=10, price=100, gateway_name="IB")}}))
+    assert main.sent[-1].type is OrderType.MARKET
+
+
+def test_exit_position_snapshot_timeout_halts(tmp_path, monkeypatch):
+    limited = StrategyConfig(**{**config(tmp_path).__dict__, "exit_position_snapshot_timeout_sec": 1})
+    engine, _ = setup(tmp_path, monkeypatch)
+    engine.config = limited
+    runtime = engine.runtimes["AAPL.SMART"]
+    runtime.awaiting_exit_position = True
+    runtime.exit_snapshot_requested_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+    engine.on_timer(Event("timer"))
+    assert engine.state is EngineState.HALTED
 
 
 def test_shutdown_unregisters_handlers_and_persists(tmp_path, monkeypatch):
@@ -245,3 +312,33 @@ def test_live_and_unknown_ports_are_rejected(tmp_path, port):
     with pytest.raises(ValueError):
         StrategyConfig(strategy_id="x", gateway_name="IB", account="DU1", host="127.0.0.1", client_id=1, port=port, capital=1,
                        state_path=tmp_path / "x.json", basket=(SymbolConfig("AAPL", "SMART", "USD", "US", 1),))
+
+
+def test_live_requires_approval_and_explicit_whitelist(tmp_path, monkeypatch):
+    common = dict(strategy_id="live", gateway_name="IB", account="U1", host="127.0.0.1", client_id=81,
+                  port=4001, capital=1, state_path=tmp_path / "live.json", basket=(SymbolConfig("AAPL", "SMART", "USD", "US", 1),),
+                  environment="live", allowed_live_accounts=("U1",), allowed_live_client_ids=(81,), live_approval_env="LIVE_TEST_APPROVAL")
+    with pytest.raises(ValueError):
+        StrategyConfig(**common)
+    monkeypatch.setenv("LIVE_TEST_APPROVAL", "approved-outside-git")
+    assert StrategyConfig(**common).environment == "live"
+    with pytest.raises(ValueError):
+        StrategyConfig(**{**common, "account": "U2"})
+
+
+def test_live_yaml_does_not_use_port_as_authorization(tmp_path, monkeypatch):
+    live = tmp_path / "live.yaml"
+    live.write_text("""ibkr:\n  environment: live\n  account: U1\n  client_id: 81\n  port: 4001\n  allowed_live_accounts: [U1]\n  allowed_live_client_ids: [81]\n  live_approval_env: LIVE_FILE_APPROVAL\nstrategy:\n  strategy_id: live\n  capital: 1\n  state_path: state.json\nbasket:\n  - symbol: AAPL\n    exchange: SMART\n    currency: USD\n    market: US\n    max_allocation: 1\n""", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_config(live)
+    monkeypatch.setenv("LIVE_FILE_APPROVAL", "yes")
+    assert load_config(live).environment == "live"
+
+
+def test_hk_contract_identity_missing_or_wrong_halts(tmp_path):
+    hk = StrategyConfig(strategy_id="hk", gateway_name="IB", account="DU1", host="127.0.0.1", client_id=1, port=7497,
+                        capital=1, state_path=tmp_path / "hk.json", basket=(SymbolConfig("0700", "SEHK", "HKD", "HK", 1, conid=700, local_symbol="0700", trading_class="STK"),))
+    engine = StrategyEngine(FakeMain(), EventEngine(), hk)
+    engine.start()
+    engine.on_contract(Event("contract", ContractData(symbol="0700", exchange=Exchange.SEHK, name="Tencent", product=Product.EQUITY, size=1, pricetick=.01, gateway_name="IB")))
+    assert engine.state is EngineState.HALTED

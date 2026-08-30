@@ -1,7 +1,7 @@
 # EC2 t3.small：从部署、Paper 到实盘的操作手册
 
 > **适用范围**：本仓库 `user_strategy` + Interactive Brokers（IBKR）股票策略。
-> **当前状态**：代码是 **Paper-only**：只接受 `environment: paper` 与端口 `7497`（TWS Paper）/`4002`（IB Gateway Paper）。实盘章节说明未来需要补齐的功能和个人上线检查，不是通过改端口绕过保护的方法。
+> **当前状态**：代码提供受控的 Paper/Live 启动路径；Live 仍默认锁定，必须同时通过独立的部署授权变量、账户/client ID 白名单、Paper 回归和人工批准。详细门禁见 [Live 解锁与运行手册](live_unlock_runbook.md)。
 
 ## 0. 运行边界与上线原则
 
@@ -31,7 +31,7 @@
 | 基础设施 | 安全、可登录的 EC2 | SSH、磁盘、swap、备份可用；API/VNC 未对公网开放 |
 | Paper 联调 | 在 `PAUSED` 下确认连接 | 账户、合约、行情、订单/持仓对账正常 |
 | Paper 验收 | 小额模拟运行 | 10 个交易日及故障演练有日志；不是“没下单”就算通过 |
-| Live（未来） | 最小规模实盘 | 完成第 6 节的代码缺口，首日全程在场并收盘对账 |
+| Live（受控） | 最小规模实盘 | 完成第 6 节验收，账户授权人解锁，首日全程在场并收盘对账 |
 
 ## 2. AWS 与 Ubuntu 初始化（阶段 A）
 
@@ -249,9 +249,9 @@ python -c "from user_strategy.config import load_config; print(load_config('/srv
 
 Paper 验收至少持续 10 个正常交易日，并按 [Paper 故障演练](paper_runbook.md) 留存证据。必须成功演练：断线、重连后对账、重启、部分成交、拒单、撤单、账户错误、闭市/午休。每笔交易保留 `signal -> order -> trade -> position -> stop -> exit` 的日志与 Gateway 订单/成交/持仓导出。
 
-## 6. 进入实盘前的工程缺口（阶段 D，必须完成）
+## 6. 进入实盘前的工程门禁（阶段 D，必须验证）
 
-当前仓库**不具备 Live 启动路径**。严禁只把 YAML 改为 `live` 或把端口改成 `4001/7496`。开始实盘开发前，应在独立分支完成测试和 Paper 回归，并补齐：
+仓库已具备受控 Live 启动路径，但严禁只把 YAML 改为 `live` 或把端口改成 `4001/7496`。必须完成相同 release 的测试和 Paper 回归，并按 [Live 解锁与运行手册](live_unlock_runbook.md) 留存证据：
 
 1. **明确 Live 模式**：在配置模型中显式区分 Paper/Live，而非通过端口猜测；Live 必须要求第二个独立的、不会提交到 Git 的确认凭据或部署时批准标识。
 2. **账户与合约白名单**：Live 账户、市场、币种、标的、交易所和 client ID 全部显式校验；HK 标的还应固定并校验 `conId`、`localSymbol` 与 `tradingClass`。
@@ -260,7 +260,7 @@ Paper 验收至少持续 10 个正常交易日，并按 [Paper 故障演练](pap
 5. **风险与熔断**：增加经过测试的单笔金额、活动委托数、日损失和 kill switch 限制；策略内限额不是唯一防线。
 6. **告警、备份与恢复**：至少通知到你常看的渠道（进程退出、断线、`HALTED`、磁盘不足、拒单、日损失）；备份 state/logs，并在 Paper 演练恢复。Docker 则记录并固定镜像 ID，不在运行中的容器内安装依赖。
 
-上述变更的验收标准是：离线单元测试覆盖 Live 拒绝/授权、错误账户、错误合约、断线、重连、未知订单、部分成交、保护单失败、熔断与重启；随后以相同 release 在 Paper 完整回归。没有完整证据，不生成 Live release。
+验收标准是：离线单元测试覆盖 Live 拒绝/授权、错误账户、错误合约、断线、重连、未知订单、部分成交、保护单失败、熔断与重启；随后以相同 release 在 Paper 完整回归。没有完整证据，不设置 Live approval 环境变量。
 
 ## 7. 实盘部署与首日运行（阶段 E）
 

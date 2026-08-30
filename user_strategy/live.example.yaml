@@ -1,0 +1,32 @@
+# Template only. Keep the real file outside Git and set IBKR_LIVE_APPROVAL in the service environment.
+ibkr:
+  environment: live
+  gateway_name: IB
+  host: 127.0.0.1
+  client_id: 81
+  account: U0000000
+  port: 4001
+  allowed_live_accounts: [U0000000]
+  allowed_live_client_ids: [81]
+  live_approval_env: IBKR_LIVE_APPROVAL
+
+alerts:
+  telegram_token_env: IBKR_TELEGRAM_BOT_TOKEN
+  telegram_chat_id: "replace-with-private-chat-id"
+  disk_free_min_mb: 1024
+
+strategy:
+  strategy_id: us-live-tiny-001
+  capital: 1000
+  state_path: state/us-live-tiny-001.json
+  max_order_notional: 50
+  max_active_orders: 1
+  daily_loss_limit_pct: 0.01
+
+basket:
+  - symbol: AAPL
+    exchange: SMART
+    currency: USD
+    market: US
+    max_allocation: 50
+    lot_size: 1

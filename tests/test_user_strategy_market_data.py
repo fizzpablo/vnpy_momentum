@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from vnpy.trader.constant import Exchange
 from vnpy.trader.object import TickData
@@ -7,8 +8,10 @@ from user_strategy.market_data import MarketDataAdapter
 
 
 def make_tick(at, *, price=110, volume=0, turnover=0):
-    return TickData(symbol="AAPL", exchange=Exchange.SMART, datetime=at, last_price=price,
-                    volume=volume, turnover=turnover, gateway_name="IB")
+    vwap = turnover / volume if volume else 1
+    return SimpleNamespace(symbol="AAPL", exchange=Exchange.SMART, vt_symbol="AAPL.SMART", datetime=at, last_price=price,
+                           volume=volume, turnover=turnover, gateway_name="IB",
+                           extra={"ib_market_data_type": 1, "ib_rt_time": at, "ib_rt_trade_volume": volume, "ib_vwap": vwap})
 
 
 def ready_adapter():

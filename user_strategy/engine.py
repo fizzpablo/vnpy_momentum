@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
+from shutil import disk_usage
 from typing import Any
 
 from vnpy.event import Event, EventEngine, EVENT_TIMER
 from vnpy.trader.constant import Direction, Exchange, Interval, Offset, OrderType, Product, Status
-from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_ORDER, EVENT_POSITION, EVENT_TICK, EVENT_TRADE
-from vnpy.trader.object import AccountData, ContractData, HistoryRequest, OrderData, OrderRequest, PositionData, TickData, TradeData
+from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK, EVENT_TRADE
+from vnpy.trader.object import AccountData, ContractData, HistoryRequest, LogData, OrderData, OrderRequest, PositionData, TickData, TradeData
 
 from .calendar import is_open
 from .config import StrategyConfig, SymbolConfig
+from .alerts import TelegramAlerts
 from .market_data import MarketDataAdapter
 from .state import StateStore
 
@@ -42,6 +44,12 @@ class SymbolRuntime:
     stop_order: str = ""
     exit_order: str = ""
     canceling_stop: bool = False
+    replacing_stop: bool = False
+    exit_requested: bool = False
+    awaiting_exit_position: bool = False
+    position_version: int = 0
+    exit_position_version: int = 0
+    exit_snapshot_requested_at: datetime | None = None
     consumed_signal_sequence: int = 0
     contract_ready: bool = False
 
@@ -67,9 +75,14 @@ class StrategyEngine:
         self.account_ready = False
         self.cash_ready = config.basket[0].market != "HK"
         self.reconciled = False
+        self.snapshot_complete = False
         self.realized_pnl = 0.0
+        self.daily_realized_pnl = 0.0
+        self.pnl_day: date = datetime.now(timezone.utc).date()
         self._seen_trades: set[str] = set()
         self._registered = False
+        self._last_disk_check: datetime | None = None
+        self.alerts = TelegramAlerts(config.alerts)
 
     @staticmethod
     def _exchange(symbol: SymbolConfig) -> Exchange:
@@ -81,8 +94,10 @@ class StrategyEngine:
     def start(self) -> None:
         """Register handlers and reconcile before accepting the manual start command."""
         persisted = self.store.load()
+        if persisted.get("pnl_day") == datetime.now(timezone.utc).date().isoformat():
+            self.realized_pnl = float(persisted.get("realized_pnl", 0.0))
+            self.daily_realized_pnl = float(persisted.get("daily_realized_pnl", 0.0))
         self._register()
-        self.reconcile()
         for vt_symbol, runtime in self.runtimes.items():
             sequence = persisted.get("signal_sequences", {}).get(vt_symbol, 0)
             if not isinstance(sequence, int) or sequence < 0:
@@ -106,7 +121,7 @@ class StrategyEngine:
     def command(self, command: str) -> None:
         command = command.lower()
         if command == "start":
-            if self.state != EngineState.PAUSED or not self.reconciled or not self.account_ready or not self.cash_ready or not all(item.contract_ready for item in self.runtimes.values()):
+            if self.state != EngineState.PAUSED or not self.snapshot_complete or not self.reconciled or not self.account_ready or not self.cash_ready or not all(item.contract_ready for item in self.runtimes.values()):
                 self._log("start refused: preflight is incomplete")
                 return
             self.state = EngineState.RUNNING
@@ -122,8 +137,13 @@ class StrategyEngine:
                 self.state = EngineState.PAUSED
                 for item in self.runtimes.values():
                     item.state = SymbolState.IDLE
+        elif command in {"kill", "stop_new_orders"}:
+            # A kill switch is deliberately narrow: it never submits a closing order.
+            if self.state != EngineState.HALTED:
+                self.state = EngineState.PAUSED
+            self._log("kill switch: new entry orders disabled")
         else:
-            raise ValueError("command must be start, pause, close_all, or reset")
+            raise ValueError("command must be start, pause, close_all, reset, kill, or stop_new_orders")
         self._persist()
 
     def reconcile(self) -> None:
@@ -142,9 +162,21 @@ class StrategyEngine:
             return
         self.reconciled = True
 
+    def notify_broker_snapshot_complete(self) -> None:
+        """Gateway integration hook: only a completed broker snapshot may set READY.
+
+        The current upstream public API does not expose this completion signal, so the
+        normal host deliberately never calls it for Live.  A verified thin vnpy_ib
+        extension may call this after account/position/open-order end callbacks.
+        """
+        self.reconcile()
+        if self.reconciled:
+            self.snapshot_complete = True
+
     def notify_gateway_disconnected(self) -> None:
         """Called by the application host when its gateway health check reports loss."""
         self.reconciled = False
+        self.snapshot_complete = False
         if self.state == EngineState.RUNNING:
             self.state = EngineState.PAUSED
         self._log("gateway disconnected: new BUY orders paused")
@@ -153,10 +185,10 @@ class StrategyEngine:
     def notify_gateway_reconnected(self) -> None:
         """Reconciliation is required again; this never resumes RUNNING automatically."""
         self.reconciled = False
-        self.reconcile()
+        self.snapshot_complete = False
         if self.state == EngineState.RUNNING:
             self.state = EngineState.PAUSED
-        self._log("gateway reconnected: manual start required after reconciliation")
+        self._log("gateway reconnected: waiting for broker snapshot before manual start")
         self._persist()
 
     def _load_references(self) -> None:
@@ -178,7 +210,10 @@ class StrategyEngine:
     def _handlers(self) -> tuple[tuple[str, Any], ...]:
         return ((EVENT_TICK, self.on_tick), (EVENT_ORDER, self.on_order), (EVENT_TRADE, self.on_trade),
                 (EVENT_POSITION, self.on_position), (EVENT_ACCOUNT, self.on_account),
-                (EVENT_CONTRACT, self.on_contract), (EVENT_TIMER, self.on_timer))
+                (EVENT_CONTRACT, self.on_contract), (EVENT_LOG, self.on_log),
+                ("eIbConnection", self.on_ib_connection), ("eIbSnapshot", self.on_ib_snapshot),
+                ("eIbPositionSnapshot", self.on_ib_position_snapshot),
+                (EVENT_TIMER, self.on_timer))
 
     def _register(self) -> None:
         if not self._registered:
@@ -188,12 +223,16 @@ class StrategyEngine:
 
     def on_account(self, event: Event) -> None:
         account: AccountData = event.data
-        expected = f"{self.config.gateway_name}.{self.config.account}."
-        if account.vt_accountid.startswith(expected):
+        if account.gateway_name != self.config.gateway_name:
+            return
+        received = account.accountid.split(".", 1)[0]
+        if received == self.config.account:
             self.account_ready = True
             if self.config.basket[0].market == "HK":
                 cash = (account.extra or {}).get("ib_cash_balance")
                 self.cash_ready = isinstance(cash, (int, float)) and cash >= 0
+        else:
+            self.halt("unexpected IBKR account event")
 
     def on_contract(self, event: Event) -> None:
         contract: ContractData = event.data
@@ -203,7 +242,66 @@ class StrategyEngine:
         if contract.product != Product.EQUITY or contract.exchange != self._exchange(runtime.config):
             self.halt("contract does not match configured equity")
             return
+        if self.config.environment == "live" and (contract.extra or {}).get("currency") != runtime.config.currency:
+            self.halt("contract currency does not match whitelist")
+            return
+        if runtime.config.market == "HK":
+            extra = contract.extra or {}
+            if (extra.get("conId", extra.get("conid")) != runtime.config.conid
+                    or extra.get("localSymbol") != runtime.config.local_symbol
+                    or extra.get("tradingClass") != runtime.config.trading_class):
+                self.halt("HK contract identity does not match whitelist")
+                return
         runtime.contract_ready = True
+
+    def on_ib_connection(self, event: Event) -> None:
+        data = event.data
+        if isinstance(data, dict) and data.get("connected") is True:
+            self.notify_gateway_reconnected()
+        else:
+            self.notify_gateway_disconnected()
+
+    def on_ib_snapshot(self, event: Event) -> None:
+        data = event.data
+        if isinstance(data, dict) and data.get("complete") is True and data.get("account") == self.config.account:
+            self.notify_broker_snapshot_complete()
+
+    def on_ib_position_snapshot(self, event: Event) -> None:
+        data = event.data
+        if not isinstance(data, dict) or data.get("account") != self.config.account:
+            return
+        positions = data.get("positions")
+        if not isinstance(positions, dict):
+            self.halt("invalid broker position snapshot")
+            return
+        for vt_symbol, runtime in self.runtimes.items():
+            if not runtime.awaiting_exit_position:
+                continue
+            position = positions.get(vt_symbol)
+            runtime.awaiting_exit_position = False
+            if position is None or position.volume <= 0:
+                runtime.exit_requested = False
+                runtime.position = None
+                runtime.state = SymbolState.HALTED
+            else:
+                runtime.position = position
+                self._send_exit(runtime)
+            runtime.exit_snapshot_requested_at = None
+
+    def on_log(self, event: Event) -> None:
+        """Map existing vn.py gateway logs to the strategy's connection gate.
+
+        This is intentionally a thin listener, not a replacement reconnect client.
+        ``vnpy_ib`` emits gateway errors/status through its normal log event.
+        """
+        log: LogData = event.data
+        if log.gateway_name != self.config.gateway_name:
+            return
+        message = log.msg.lower()
+        if any(text in message for text in ("disconnected", "connection closed", "not connected", "连接断开")):
+            self.notify_gateway_disconnected()
+        elif any(text in message for text in ("connected", "connection established", "连接成功")):
+            self.notify_gateway_reconnected()
 
     def on_tick(self, event: Event) -> None:
         tick: TickData = event.data
@@ -211,15 +309,15 @@ class StrategyEngine:
         if not runtime:
             return
         now = datetime.now(timezone.utc)
-        observation = self.market.update(tick, now)
+        observation = self.market.update(tick, now, runtime.config.volume_multiplier)
         is_fresh_tick = (
             tick.datetime.tzinfo is not None
-            and observation.timestamp == tick.datetime.astimezone(timezone.utc)
+            and observation.timestamp == (getattr(tick, "extra", None) or {}).get("ib_rt_time", tick.datetime).astimezone(timezone.utc)
         )
         if observation.price and is_fresh_tick:
             self._evaluate_exit(runtime, observation.price)
             self._evaluate_global_risk()
-        if self.state != EngineState.RUNNING or runtime.state != SymbolState.IDLE:
+        if self.state != EngineState.RUNNING or runtime.state not in {SymbolState.IDLE, SymbolState.ENTERED}:
             return
         if not is_fresh_tick or not self.reconciled or not self.account_ready or not runtime.reference_price:
             return
@@ -229,7 +327,10 @@ class StrategyEngine:
             tick.vt_symbol, runtime.reference_price, self.config.turnover_threshold, now,
             self.config.price_gain_threshold_pct,
         )
-        if valid and not runtime.entry_order and sequence > runtime.consumed_signal_sequence:
+        scale_allowed = runtime.state == SymbolState.IDLE or (
+            runtime.position is not None and observation.price >= runtime.position.price * (1 + self.config.scale_in_gain_pct)
+        )
+        if valid and scale_allowed and not runtime.entry_order and not runtime.exit_requested and sequence > runtime.consumed_signal_sequence:
             self._send_entry(runtime, observation.price, sequence)
 
     def on_order(self, event: Event) -> None:
@@ -237,13 +338,21 @@ class StrategyEngine:
         runtime = self.runtimes.get(order.vt_symbol)
         if not runtime:
             return
-        if order.vt_orderid == runtime.entry_order and order.status in {Status.REJECTED, Status.CANCELLED}:
+        if order.vt_orderid == runtime.entry_order and order.status in {Status.REJECTED, Status.CANCELLED, Status.ALLTRADED}:
             runtime.entry_order = ""
+            if runtime.exit_requested:
+                self._advance_exit(runtime)
         if order.vt_orderid == runtime.stop_order and order.status in {Status.REJECTED, Status.CANCELLED}:
             runtime.stop_order = ""
-            if runtime.canceling_stop:
+            if order.status == Status.REJECTED and self._position_volume(runtime):
+                self.halt("protective STOP rejected")
+            elif runtime.replacing_stop:
+                runtime.replacing_stop = False
+                self._ensure_stop(runtime)
+            elif runtime.canceling_stop:
                 runtime.canceling_stop = False
-                self._send_exit(runtime)
+                runtime.awaiting_exit_position = True
+                self._request_position_snapshot(runtime)
             elif self._position_volume(runtime):
                 self.halt("protective STOP missing")
         if order.vt_orderid == runtime.exit_order and order.status == Status.REJECTED:
@@ -258,9 +367,12 @@ class StrategyEngine:
                 return
             self._seen_trades.add(trade.vt_tradeid)
             if trade.direction == Direction.SHORT and runtime.position:
-                self.realized_pnl += (trade.price - runtime.position.price) * trade.volume
-                self.realized_pnl -= abs(trade.price * trade.volume) * self.config.estimated_fee_pct
+                pnl = (trade.price - runtime.position.price) * trade.volume
+                pnl -= abs(trade.price * trade.volume) * self.config.estimated_fee_pct
+                self.realized_pnl += pnl
+                self.daily_realized_pnl += pnl
             self._log(f"trade {trade.vt_orderid} {trade.volume}")
+            self._persist()
 
     def on_position(self, event: Event) -> None:
         position: PositionData = event.data
@@ -270,6 +382,7 @@ class StrategyEngine:
         if position.direction not in {Direction.NET, Direction.LONG}:
             self.halt("unexpected short position")
             return
+        runtime.position_version += 1
         if position.volume > 0 and runtime.state == SymbolState.IDLE and not runtime.entry_order:
             self.halt("broker/local position mismatch")
             return
@@ -279,8 +392,8 @@ class StrategyEngine:
             return
         if position.volume > 0:
             runtime.state = SymbolState.ENTERED
-            if not runtime.stop_order and not runtime.canceling_stop and not runtime.exit_order:
-                self._send_stop(runtime)
+            if not runtime.awaiting_exit_position and not runtime.exit_requested:
+                self._ensure_stop(runtime)
         elif runtime.state == SymbolState.ENTERED and not runtime.exit_order:
             runtime.state = SymbolState.HALTED
         self._persist()
@@ -289,6 +402,19 @@ class StrategyEngine:
         if self.state == EngineState.RUNNING and not self.account_ready:
             self.state = EngineState.PAUSED
             self._persist()
+        now = datetime.now(timezone.utc)
+        if now.date() != self.pnl_day:
+            self.pnl_day, self.daily_realized_pnl = now.date(), 0.0
+        if self._last_disk_check is None or (now - self._last_disk_check).total_seconds() >= 60:
+            self._last_disk_check = now
+            free_mb = disk_usage(self.config.state_path.parent).free // (1024 * 1024)
+            if free_mb < self.config.alerts.disk_free_min_mb:
+                self.halt("disk free space below configured minimum")
+        for runtime in self.runtimes.values():
+            requested_at = runtime.exit_snapshot_requested_at
+            if runtime.awaiting_exit_position and requested_at and (now - requested_at).total_seconds() > self.config.exit_position_snapshot_timeout_sec:
+                runtime.exit_snapshot_requested_at = None
+                self.halt("exit broker position snapshot timed out; manual IBKR takeover required")
 
     def _send_entry(self, runtime: SymbolRuntime, price: float, sequence: int) -> None:
         qty = self._quantity(runtime, price, self.config.base_position_pct)
@@ -327,8 +453,45 @@ class StrategyEngine:
             self.halt("STOP submission unconfirmed")
         self._persist()
 
+    def _ensure_stop(self, runtime: SymbolRuntime) -> None:
+        """Keep exactly one active STOP whose quantity equals broker-reported position."""
+        position = runtime.position
+        if not position or position.volume <= 0 or runtime.exit_order or runtime.canceling_stop:
+            return
+        if not runtime.stop_order:
+            self._send_stop(runtime)
+            return
+        order = self.main_engine.get_order(runtime.stop_order)
+        if not order or not order.is_active():
+            self.halt("protective STOP status uncertain")
+            return
+        if order.volume == position.volume:
+            return
+        runtime.replacing_stop = True
+        self.state = EngineState.PAUSED
+        self.main_engine.cancel_order(order.create_cancel_request(), self.config.gateway_name)
+
     def _begin_exit(self, runtime: SymbolRuntime) -> None:
-        if not self._position_volume(runtime) or runtime.exit_order:
+        if runtime.exit_order or runtime.exit_requested:
+            return
+        runtime.exit_requested = True
+        if self.state != EngineState.HALTED:
+            self.state = EngineState.PAUSED
+        if runtime.entry_order:
+            entry = self.main_engine.get_order(runtime.entry_order)
+            if not entry:
+                self.halt("entry order status uncertain during exit")
+                return
+            if entry.is_active():
+                self.main_engine.cancel_order(entry.create_cancel_request(), self.config.gateway_name)
+                return
+            runtime.entry_order = ""
+        self._advance_exit(runtime)
+
+    def _advance_exit(self, runtime: SymbolRuntime) -> None:
+        """Entry is terminal.  Cancel the STOP before requesting a fresh position event."""
+        if not self._position_volume(runtime):
+            runtime.exit_requested = False
             return
         if runtime.stop_order:
             order = self.main_engine.get_order(runtime.stop_order)
@@ -338,7 +501,17 @@ class StrategyEngine:
             runtime.canceling_stop = True
             self.main_engine.cancel_order(order.create_cancel_request(), self.config.gateway_name)
         else:
-            self._send_exit(runtime)
+            runtime.awaiting_exit_position = True
+            self._request_position_snapshot(runtime)
+
+    def _request_position_snapshot(self, runtime: SymbolRuntime) -> None:
+        gateway = self.main_engine.get_gateway(self.config.gateway_name)
+        if not gateway:
+            self.halt("gateway unavailable for exit position refresh")
+            return
+        runtime.exit_snapshot_requested_at = datetime.now(timezone.utc)
+        gateway.query_position()
+        self._log("exit requested: broker position snapshot requested")
 
     def _send_exit(self, runtime: SymbolRuntime) -> None:
         position = runtime.position
@@ -373,9 +546,10 @@ class StrategyEngine:
             observation = self.market.data.get(vt_symbol)
             if position and position.volume > 0 and observation and observation.price:
                 unrealized += (observation.price - position.price) * position.volume
-        if self.realized_pnl + unrealized <= -self.config.aum_loss_limit_pct * self.config.capital:
+        loss = self.realized_pnl + unrealized
+        if loss <= -self.config.aum_loss_limit_pct * self.config.capital or self.daily_realized_pnl + unrealized <= -self.config.daily_loss_limit_pct * self.config.capital:
             self.state = EngineState.HALTED
-            self._log("HALTED: global strategy loss limit")
+            self._log("HALTED: strategy or daily loss limit")
             for runtime in self.runtimes.values():
                 self._begin_exit(runtime)
             self._persist()
@@ -401,6 +575,7 @@ class StrategyEngine:
     def halt(self, reason: str) -> None:
         self.state = EngineState.HALTED
         self._log(f"HALTED: {reason}")
+        self.alerts.send_event("DISK_LOW" if reason.startswith("disk ") else "HALTED")
         self._persist()
 
     def _persist(self) -> None:
@@ -408,7 +583,16 @@ class StrategyEngine:
             "state": self.state.value,
             "symbols": {key: item.state.value for key, item in self.runtimes.items()},
             "signal_sequences": {key: item.consumed_signal_sequence for key, item in self.runtimes.items()},
+            "pnl_day": self.pnl_day.isoformat(), "realized_pnl": self.realized_pnl,
+            "daily_realized_pnl": self.daily_realized_pnl,
         })
 
     def _log(self, message: str) -> None:
         self.main_engine.write_log(f"[{self.config.strategy_id}] {message}", "user_strategy")
+        lowered = message.lower()
+        if "rejected" in lowered:
+            self.alerts.send_event("ORDER_REJECTED")
+        elif "disconnected" in lowered:
+            self.alerts.send_event("GATEWAY_DISCONNECTED")
+        elif "loss limit" in lowered:
+            self.alerts.send_event("LOSS_LIMIT")

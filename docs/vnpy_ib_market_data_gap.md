@@ -5,8 +5,9 @@
 本文件只定义为 `user_strategy` 提供 Paper Trading 所需数据时，`vnpy_ib`
 应公开的最小数据契约和测试矩阵。
 
-- `vnpy` core 不修改；现有 `TickData.extra`、`BarData.turnover` 和
-  `AccountData.extra` 已足以承载 gateway 专有元数据。
+- 当前检出的 `TickData` 没有 `extra` 字段（构造器也不接受它）；不能假设 gateway
+  专有元数据可直接放入 TickData。`BarData.turnover` 与 `AccountData.extra` 可用，但实时
+  行情元数据需要一个经过确认的最小 upstream 扩展或等价的公开事件契约。
 - 不新建 IB socket/client，不替代 `IbGateway` 的订单、持仓、成交或重连机制。
 - 策略层只订阅 vn.py 事件并消费原生对象；它不读取 `gateway.api` 等私有属性。
 - 本阶段仅设计和测试计划；本文件本身不授权任何 gateway 实现改动。
